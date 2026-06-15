@@ -9,9 +9,8 @@
    not, the interface between commands and the admin tile will break. */
 #define FD_CNC_SIGNAL_ADD_AUTH_VOTER (FD_CNC_SIGNAL_HALT+1UL)
 
-#define FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_PENDING 0UL
-#define FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_SUCCESS 1UL
-#define FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_FAILED  2UL
+#define FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_SUCCESS 0UL
+#define FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_FAILED  1UL
 
 struct fd_admin_cnc_add_auth_voter {
   int   result;

@@ -73,7 +73,6 @@ add_authorized_voter( args_t *   args,
 
   /* Copy keypair to the admin cnc and send signal to the admin tile. */
   fd_admin_cnc_t * req = fd_cnc_app_laddr( cnc );
-  req->add_auth_voter.result = FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_PENDING;
   memcpy( req->add_auth_voter.keypair, args->add_authorized_voter.keypair, 64UL );
 
   uchar * keypair_wr = fd_keyload_mprotect_wr( args->add_authorized_voter.keypair, 0 );
