@@ -117,8 +117,6 @@ poll_add_authorized_voter( fd_admin_tile_ctx_t * ctx,
                            int *                 has_error ) {
   fd_keyswitch_t * tower = ctx->tower_av_keyswitch;
 
-  *has_error = 0;
-
   switch( *state ) {
     case FD_ADD_AUTH_VOTER_STATE_UNLOCKED: {
       if( FD_LIKELY( FD_KEYSWITCH_STATE_UNLOCKED==FD_ATOMIC_CAS( &tower->state, FD_KEYSWITCH_STATE_UNLOCKED, FD_KEYSWITCH_STATE_LOCKED ) ) ) {
@@ -228,6 +226,7 @@ add_authorized_voter( fd_admin_tile_ctx_t * ctx ) {
     fd_memzero_explicit( public_key, sizeof(public_key) );
     FD_LOG_ERR(( "add-authorized-voter failed: public key in key file does not match private key" ));
   }
+  fd_memzero_explicit( public_key, sizeof(public_key) );
 
   int   has_error = 0;
   ulong state     = FD_ADD_AUTH_VOTER_STATE_UNLOCKED;
@@ -235,6 +234,7 @@ add_authorized_voter( fd_admin_tile_ctx_t * ctx ) {
     poll_add_authorized_voter( ctx, &state, req->keypair, &has_error );
     if( FD_UNLIKELY( state==FD_ADD_AUTH_VOTER_STATE_UNLOCKED ) ) break;
   }
+  req->result = FD_UNLIKELY( has_error ) ? FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_FAILED : FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_SUCCESS;
   fd_memzero_explicit( req->keypair, 64UL );
 }
 

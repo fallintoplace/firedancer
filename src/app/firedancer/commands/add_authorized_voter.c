@@ -87,16 +87,13 @@ add_authorized_voter( args_t *   args,
   fd_memzero_explicit( req->add_auth_voter.keypair, 64UL );
   fd_cnc_close( cnc );
 
-  /* Make sure the command completed successfully.  Any in-process
-     update should pass.  If it doesn't, something is wrong and the
-     running firedancer validator should crash. */
-  if( FD_UNLIKELY( signal!=FD_CNC_SIGNAL_RUN ) ) {
-    FD_LOG_ERR(( "admin tile failed while adding authorized voter, signal %lu", signal ));
-  }
+  if( FD_UNLIKELY( signal!=FD_CNC_SIGNAL_RUN ) ) FD_LOG_ERR(( "admin tile failed while adding authorized voter, signal %lu", signal ));
+
   if( FD_UNLIKELY( result!=FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_SUCCESS ) ) {
-    FD_LOG_ERR(( "Failed to add authorized voter key, check validator logs for details" ));
+    FD_LOG_WARNING(( "Failed to add authorized voter key, check validator logs for more details" ));
+  } else {
+    FD_LOG_NOTICE(( "Authorized voter key added" ));
   }
-  FD_LOG_NOTICE(( "Authorized voter key added" ));
 }
 
 void
