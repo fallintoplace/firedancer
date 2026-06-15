@@ -1,9 +1,16 @@
 #include "../../disco/topo/fd_topo.h"
+#include "../../disco/keyguard/fd_keyswitch.h"
+#include "../../ballet/ed25519/fd_ed25519.h"
 
+#include "fd_admin.h"
 #include "generated/fd_admin_tile_seccomp.h"
 
 struct fd_admin_tile_ctx {
-  ulong unused;
+  fd_cnc_t *       cnc;
+  fd_keyswitch_t * tower_av_keyswitch;
+  fd_keyswitch_t * sign_av_keyswitch[ FD_TOPO_MAX_TILES ];
+  ulong            sign_av_keyswitch_cnt;
+  fd_sha512_t      sha512[ 1 ];
 };
 
 typedef struct fd_admin_tile_ctx fd_admin_tile_ctx_t;
@@ -20,49 +27,251 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
 }
 
 static void
-privileged_init( fd_topo_t const *      topo,
-                 fd_topo_tile_t const * tile ) {
-  (void)topo;
-  (void)tile;
-}
-
-static void
 unprivileged_init( fd_topo_t const *      topo,
                    fd_topo_tile_t const * tile ) {
-  (void)topo;
-  (void)tile;
+  void *                scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
+  fd_admin_tile_ctx_t * ctx     = (fd_admin_tile_ctx_t *)scratch;
+  fd_memset( ctx, 0, sizeof(fd_admin_tile_ctx_t) );
+
+  fd_topo_obj_t const * cnc_obj = fd_topo_find_tile_obj( topo, tile, "cnc" );
+  FD_TEST( cnc_obj );
+
+  ctx->cnc = fd_cnc_join( fd_topo_obj_laddr( topo, cnc_obj->id ) );
+  FD_TEST( ctx->cnc );
+  FD_TEST( fd_cnc_type( ctx->cnc )==FD_CNC_ADMIN_TYPE );
+  FD_TEST( fd_cnc_app_sz( ctx->cnc )>=sizeof(fd_admin_cnc_t) );
+
+  ulong tower_idx = fd_topo_find_tile( topo, "tower", 0UL );
+  FD_TEST( tower_idx!=ULONG_MAX );
+  FD_TEST( topo->tiles[ tower_idx ].av_keyswitch_obj_id!=ULONG_MAX );
+  ctx->tower_av_keyswitch = fd_keyswitch_join( fd_topo_obj_laddr( topo, topo->tiles[ tower_idx ].av_keyswitch_obj_id ) );
+  FD_TEST( ctx->tower_av_keyswitch );
+
+  for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
+    fd_topo_tile_t const * sign_tile = &topo->tiles[ i ];
+    if( FD_LIKELY( strcmp( sign_tile->name, "sign" ) ) ) continue;
+    FD_TEST( sign_tile->av_keyswitch_obj_id!=ULONG_MAX );
+    ctx->sign_av_keyswitch[ ctx->sign_av_keyswitch_cnt ] = fd_keyswitch_join( fd_topo_obj_laddr( topo, sign_tile->av_keyswitch_obj_id ) );
+    FD_TEST( ctx->sign_av_keyswitch[ ctx->sign_av_keyswitch_cnt ] );
+    ctx->sign_av_keyswitch_cnt++;
+  }
+  FD_TEST( ctx->sign_av_keyswitch_cnt );
+
+  FD_TEST( fd_sha512_join( fd_sha512_new( ctx->sha512 ) ) );
+
+  fd_cnc_signal( ctx->cnc, FD_CNC_SIGNAL_RUN );
 }
 
-static inline void
+/* The process of adding an authorized voter to the validator must be
+   done carefully in order to prevent vote transactions being generated
+   with an authorized voter that the sign tile is not yet aware of.
+   The authorized voter must be added to the sign tile before it is
+   added to the tower tile.  All transitions must be linear and in
+   forward order. */
+
+/* State 0: UNLOCKED
+   The validator is not currently in the process of switching keys. */
+#define FD_ADD_AUTH_VOTER_STATE_UNLOCKED             (0UL)
+
+/* State 1: LOCKED
+   Some client to the validator has requested to add an authorized
+   voter.  To do so, it acquired an exclusive lock on the validator to
+   prevent the switch potentially being interleaved with another
+   client. */
+#define FD_ADD_AUTH_VOTER_STATE_LOCKED               (1UL)
+
+/* State 2: SIGN_TILE_REQUESTED
+   The first step to add an authorized voter is to notify the sign
+   tile that an authorized voter is being added. */
+#define FD_ADD_AUTH_VOTER_STATE_SIGN_TILE_REQUESTED  (2UL)
+
+/* State 3: SIGN_TILE_UPDATED
+   The Sign tile has confirmed that it has updated its internal
+   mapping for the set of supported authorized voters.  At this point
+   the sign tile is aware of the new authorized voter but the Tower
+   tile will not prepare vote transactions with the new authorized
+   voter yet. */
+#define FD_ADD_AUTH_VOTER_STATE_SIGN_TILE_UPDATED    (3UL)
+
+/* State 4: TOWER_TILE_REQUESTED
+   Once the Sign tile is updated, now the Tower tile must be notified
+   that an authorized voter is being added so it can start preparing
+   vote transactions with the new authorized voter. */
+#define FD_ADD_AUTH_VOTER_STATE_TOWER_TILE_REQUESTED (4UL)
+
+/* State 5: TOWER_TILE_UPDATED
+   The Tower tile has confirmed that it has updated its internal
+   mapping for the set of supported authorized voters. */
+#define FD_ADD_AUTH_VOTER_STATE_TOWER_TILE_UPDATED   (5UL)
+
+/* State 6: UNLOCK_REQUESTED
+   The client now requests that the Tower tile unpause the pipeline
+   so the validator can start producing votes with the new authorized
+   voter. */
+#define FD_ADD_AUTH_VOTER_STATE_UNLOCK_REQUESTED     (6UL)
+
+static void FD_FN_SENSITIVE
+poll_add_authorized_voter( fd_admin_tile_ctx_t * ctx,
+                           ulong *               state,
+                           uchar *               keypair,
+                           int *                 has_error ) {
+  fd_keyswitch_t * tower = ctx->tower_av_keyswitch;
+
+  *has_error = 0;
+
+  switch( *state ) {
+    case FD_ADD_AUTH_VOTER_STATE_UNLOCKED: {
+      if( FD_LIKELY( FD_KEYSWITCH_STATE_UNLOCKED==FD_ATOMIC_CAS( &tower->state, FD_KEYSWITCH_STATE_UNLOCKED, FD_KEYSWITCH_STATE_LOCKED ) ) ) {
+        *state = FD_ADD_AUTH_VOTER_STATE_LOCKED;
+        FD_LOG_INFO(( "Locking authorized voter set for authorized voter update..." ));
+      } else {
+        /* keyswitch changes should be guarded and ordered by CNC.  If
+           the keyswitch is in a locked state means there is unexpected
+           process state and the validator should crash. */
+        FD_LOG_CRIT(( "keyswitch is in a locked state but should be unlocked" ));
+      }
+      break;
+    }
+    case FD_ADD_AUTH_VOTER_STATE_LOCKED: {
+      for( ulong i=0UL; i<ctx->sign_av_keyswitch_cnt; i++ ) {
+        fd_keyswitch_t * sign = ctx->sign_av_keyswitch[ i ];
+        memcpy( sign->bytes, keypair, 64UL );
+        FD_COMPILER_MFENCE();
+        sign->state = FD_KEYSWITCH_STATE_SWITCH_PENDING;
+        FD_COMPILER_MFENCE();
+      }
+      fd_memzero_explicit( keypair, 32UL );
+      *state = FD_ADD_AUTH_VOTER_STATE_SIGN_TILE_REQUESTED;
+      FD_LOG_INFO(( "Requesting all sign tiles to update authorized voter key set..." ));
+      break;
+    }
+    case FD_ADD_AUTH_VOTER_STATE_SIGN_TILE_REQUESTED: {
+      int all_updated = 1;
+      for( ulong i=0UL; i<ctx->sign_av_keyswitch_cnt; i++ ) {
+        fd_keyswitch_t * sign = ctx->sign_av_keyswitch[ i ];
+        if( FD_UNLIKELY( sign->state==FD_KEYSWITCH_STATE_SWITCH_PENDING ) ) {
+          all_updated = 0;
+          break;
+        } else if( FD_UNLIKELY( sign->state==FD_KEYSWITCH_STATE_FAILED ) ) {
+          /* Recoverable error: the sign tile failed to update the set
+             of authorized voters is a result of bad caller input. */
+          fd_memzero_explicit( sign->bytes, 64UL );
+          *has_error = 1;
+          break;
+        } else { /* sign->state==FD_KEYSWITCH_STATE_COMPLETED */
+          fd_memzero_explicit( sign->bytes, 64UL );
+        }
+      }
+
+      if( FD_LIKELY( all_updated ) ) {
+        if( FD_UNLIKELY( *has_error ) ) *state = FD_ADD_AUTH_VOTER_STATE_TOWER_TILE_UPDATED;
+        else                            *state = FD_ADD_AUTH_VOTER_STATE_SIGN_TILE_UPDATED;
+      } else {
+        FD_SPIN_PAUSE();
+      }
+      break;
+    }
+    case FD_ADD_AUTH_VOTER_STATE_SIGN_TILE_UPDATED: {
+      memcpy( tower->bytes, keypair+32UL, 32UL );
+      FD_COMPILER_MFENCE();
+      tower->state = FD_KEYSWITCH_STATE_SWITCH_PENDING;
+      FD_COMPILER_MFENCE();
+      *state = FD_ADD_AUTH_VOTER_STATE_TOWER_TILE_REQUESTED;
+      FD_LOG_INFO(( "Requesting tower tile to update authorized voter key set..." ));
+      break;
+    }
+    case FD_ADD_AUTH_VOTER_STATE_TOWER_TILE_REQUESTED: {
+      /* There is a guarantee that the tower tile will be in sync with
+         the set of authorized voters in the sign tile.  At this point
+         that means that the command should succeed because invariants
+         such as not having duplicate authorized voter keys and too many
+         authorized voters are upheld.  If this doesn't hold true, the
+         Tower tile will detect any corruption and gracefully crash the
+         validator. */
+      if( FD_LIKELY( tower->state==FD_KEYSWITCH_STATE_COMPLETED ) ) {
+        *state = FD_ADD_AUTH_VOTER_STATE_TOWER_TILE_UPDATED;
+        FD_LOG_INFO(( "Tower tile key set successfully updated..." ));
+      } else {
+        FD_SPIN_PAUSE();
+      }
+      break;
+    }
+    case FD_ADD_AUTH_VOTER_STATE_TOWER_TILE_UPDATED: {
+      tower->state = FD_KEYSWITCH_STATE_UNHALT_PENDING;
+      *state       = FD_ADD_AUTH_VOTER_STATE_UNLOCK_REQUESTED;
+      FD_LOG_INFO(( "Requesting an unlock of the authorized voter key set..." ));
+      break;
+    }
+    case FD_ADD_AUTH_VOTER_STATE_UNLOCK_REQUESTED: {
+      if( FD_LIKELY( tower->state==FD_KEYSWITCH_STATE_UNLOCKED ) ) {
+        *state = FD_ADD_AUTH_VOTER_STATE_UNLOCKED;
+        FD_LOG_INFO(( "Authorized voter key set unlocked..." ));
+      } else {
+        FD_SPIN_PAUSE();
+      }
+      break;
+    }
+    default: {
+      FD_LOG_CRIT(( "Unexpected add-authorized-voter state %lu", *state ));
+    }
+  }
+}
+
+static void FD_FN_SENSITIVE
+add_authorized_voter( fd_admin_tile_ctx_t * ctx ) {
+
+  fd_admin_cnc_add_auth_voter_t * req = fd_cnc_app_laddr( ctx->cnc );
+
+  uchar public_key[ 32UL ];
+  fd_ed25519_public_from_private( public_key, req->keypair, ctx->sha512 );
+  if( FD_UNLIKELY( memcmp( public_key, req->keypair+32UL, 32UL ) ) ) {
+    fd_memzero_explicit( public_key, sizeof(public_key) );
+    FD_LOG_ERR(( "add-authorized-voter failed: public key in key file does not match private key" ));
+  }
+
+  int   has_error = 0;
+  ulong state     = FD_ADD_AUTH_VOTER_STATE_UNLOCKED;
+  for(;;) {
+    poll_add_authorized_voter( ctx, &state, req->keypair, &has_error );
+    if( FD_UNLIKELY( state==FD_ADD_AUTH_VOTER_STATE_UNLOCKED ) ) break;
+  }
+  fd_memzero_explicit( req->keypair, 64UL );
+}
+
+static inline void FD_FN_SENSITIVE
 after_credit( fd_admin_tile_ctx_t * ctx,
-              fd_stem_context_t *   stem,
-              int *                 opt_poll_in,
+              fd_stem_context_t *   stem FD_PARAM_UNUSED,
+              int *                 opt_poll_in FD_PARAM_UNUSED,
               int *                 charge_busy ) {
-  (void)ctx;
-  (void)stem;
-  (void)opt_poll_in;
-  (void)charge_busy;
+
+  ulong signal = fd_cnc_signal_query( ctx->cnc );
+  switch( signal ) {
+    case FD_CNC_SIGNAL_RUN: return;
+    case FD_CNC_SIGNAL_ADD_AUTH_VOTER:
+      add_authorized_voter( ctx );
+      fd_cnc_signal( ctx->cnc, FD_CNC_SIGNAL_RUN );
+      *charge_busy = 1;
+      break;
+    default:
+      FD_LOG_ERR(( "unexpected admin cnc signal %lu", signal ));
+  }
 }
 
 static ulong
-populate_allowed_seccomp( fd_topo_t const *      topo,
-                          fd_topo_tile_t const * tile,
+populate_allowed_seccomp( fd_topo_t const *      topo FD_PARAM_UNUSED,
+                          fd_topo_tile_t const * tile FD_PARAM_UNUSED,
                           ulong                  out_cnt,
                           struct sock_filter *   out ) {
-  (void)topo;
-  (void)tile;
 
   populate_sock_filter_policy_fd_admin_tile( out_cnt, out, (uint)fd_log_private_logfile_fd() );
   return sock_filter_policy_fd_admin_tile_instr_cnt;
 }
 
 static ulong
-populate_allowed_fds( fd_topo_t const *      topo,
-                      fd_topo_tile_t const * tile,
+populate_allowed_fds( fd_topo_t const *      topo FD_PARAM_UNUSED,
+                      fd_topo_tile_t const * tile FD_PARAM_UNUSED,
                       ulong                  out_fds_cnt,
                       int *                  out_fds ) {
-  (void)topo;
-  (void)tile;
 
   if( FD_UNLIKELY( out_fds_cnt<2UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
 
@@ -89,7 +298,6 @@ fd_topo_run_tile_t fd_tile_admin = {
   .populate_allowed_fds     = populate_allowed_fds,
   .scratch_align            = scratch_align,
   .scratch_footprint        = scratch_footprint,
-  .privileged_init          = privileged_init,
   .unprivileged_init        = unprivileged_init,
   .run                      = stem_run,
 };
