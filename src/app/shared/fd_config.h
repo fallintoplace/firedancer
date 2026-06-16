@@ -357,6 +357,7 @@ struct fd_config {
     struct {
       int report_shreds;
       int report_transactions;
+      int report_runtime_txn;
     } event;
 
     struct {
