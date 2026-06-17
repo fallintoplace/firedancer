@@ -646,6 +646,7 @@ struct fd_topo_tile {
       ulong txncache_obj_id;
       ulong progcache_obj_id;
       ulong accdb_obj_id;
+      int   report_runtime_txn;
     } execle;
 
     struct {
