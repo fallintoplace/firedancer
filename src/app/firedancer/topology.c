@@ -22,7 +22,6 @@
 #include "../../util/tile/fd_tile_private.h"
 #include "../../discof/restore/utils/fd_ssctrl.h"
 #include "../../discof/restore/utils/fd_ssmsg.h"
-#include "../../discof/admin/fd_admin.h"
 #include "../../flamenco/capture/fd_solcap_writer.h"
 #include "../../flamenco/progcache/fd_progcache_admin.h"
 #include "../../flamenco/runtime/fd_cost_tracker.h"
@@ -697,10 +696,8 @@ fd_topo_initialize( config_t * config ) {
   }
 
   fd_topo_tile_t * admin_tile = fd_topob_tile( topo, "admin", "admin", "metric_in", ULONG_MAX, 0, 0, 0 );
-  fd_topo_obj_t * admin_cnc = fd_topob_obj_named( topo, "cnc", "admin", "admin" );
-  FD_TEST( fd_pod_insertf_ulong( topo->props, sizeof(fd_admin_cnc_t), "obj.%lu.app_sz", admin_cnc->id ) );
-  FD_TEST( fd_pod_insertf_ulong( topo->props, FD_CNC_ADMIN_TYPE,      "obj.%lu.type",   admin_cnc->id ) );
-  fd_topob_tile_uses( topo, admin_tile, admin_cnc, FD_SHMEM_JOIN_MODE_READ_WRITE );
+  fd_topo_obj_t * admin_ctl = fd_topob_obj_named( topo, "adminctl", "admin", "admin" );
+  fd_topob_tile_uses( topo, admin_tile, admin_ctl, FD_SHMEM_JOIN_MODE_READ_WRITE );
   for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
     if( FD_LIKELY( topo->tiles[ i ].av_keyswitch_obj_id==ULONG_MAX ) ) continue;
     fd_topob_tile_uses( topo, admin_tile, &topo->objs[ topo->tiles[ i ].av_keyswitch_obj_id ], FD_SHMEM_JOIN_MODE_READ_WRITE );

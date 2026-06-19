@@ -4,11 +4,9 @@
 
 #include "../../../disco/topo/fd_topo.h"
 #include "../../../disco/keyguard/fd_keyload.h"
-#include "../../../discof/admin/fd_admin.h"
+#include "../../../discof/admin/fd_adminctl.h"
 #include "../../../ballet/ed25519/fd_ed25519.h"
 
-#include <limits.h>
-#include <strings.h>
 #include <unistd.h>
 
 void
@@ -38,7 +36,6 @@ static void FD_FN_SENSITIVE
 add_authorized_voter( args_t *   args,
                       config_t * config ) {
 
-  /* Sanity check on the input. */
   uchar       public_key[ 32 ];
   fd_sha512_t sha512[ 1 ];
   FD_TEST( fd_sha512_join( fd_sha512_new( sha512 ) ) );
@@ -50,45 +47,29 @@ add_authorized_voter( args_t *   args,
                  "Firedancer will not use the key pair to sign as it might leak the private key." ));
   }
 
-  /* Join the CNC object. Once it's open, we can send a request to the
-     admin tile.  If another caller has an active command session, we'll
-     wait for it to complete.  Otherwise, fail because something is
-     wrong. */
-  fd_topo_obj_t const * admin_cnc_obj = fd_topo_find_obj( &config->topo, "cnc", "admin", 0UL );
-  if( FD_UNLIKELY( !admin_cnc_obj ) ) FD_LOG_ERR(( "admin tile command endpoint not found" ));
+  /* Join the adminctl object.  Once joined, we can publish a request to
+     the admin tile. */
+  fd_topo_obj_t const * admin_ctl_obj = fd_topo_find_obj( &config->topo, "adminctl", "admin", 0UL );
+  if( FD_UNLIKELY( !admin_ctl_obj ) ) FD_LOG_ERR(( "admin tile command endpoint not found" ));
 
-  fd_topo_join_workspace( &config->topo, &config->topo.workspaces[ admin_cnc_obj->wksp_id ], FD_SHMEM_JOIN_MODE_READ_WRITE, FD_TOPO_CORE_DUMP_LEVEL_DISABLED );
+  fd_topo_join_workspace( &config->topo, &config->topo.workspaces[ admin_ctl_obj->wksp_id ], FD_SHMEM_JOIN_MODE_READ_WRITE, FD_TOPO_CORE_DUMP_LEVEL_DISABLED );
 
-  fd_cnc_t * cnc = fd_cnc_join( fd_topo_obj_laddr( &config->topo, admin_cnc_obj->id ) );
-  if( FD_UNLIKELY( !cnc ) ) FD_LOG_ERR(( "fd_cnc_join failed" ));
-  if( FD_UNLIKELY( fd_cnc_type( cnc )!=FD_CNC_ADMIN_TYPE ) ) FD_LOG_ERR(( "unexpected admin cnc type %lu", fd_cnc_type( cnc ) ));
+  fd_adminctl_t * adminctl = fd_adminctl_join( fd_topo_obj_laddr( &config->topo, admin_ctl_obj->id ) );
+  if( FD_UNLIKELY( !adminctl ) ) FD_LOG_ERR(( "fd_adminctl_join failed" ));
 
-  int err;
-  err = fd_cnc_open( cnc );
-  while( FD_UNLIKELY( err==FD_CNC_ERR_AGAIN ) ) {
-    FD_SPIN_PAUSE();
-    err = fd_cnc_open( cnc );
-  }
-  if( FD_UNLIKELY( err!=FD_CNC_SUCCESS ) ) FD_LOG_ERR(( "add-authorized-voter failed because the command-and-control failed (%s)", fd_cnc_strerror( err ) ));
-
-  /* Copy keypair to the admin cnc and send signal to the admin tile. */
-  fd_admin_cnc_t * req = fd_cnc_app_laddr( cnc );
+  fd_adminctl_app_t req[ 1 ];
   memcpy( req->add_auth_voter.keypair, args->add_authorized_voter.keypair, 64UL );
 
   uchar * keypair_wr = fd_keyload_mprotect_wr( args->add_authorized_voter.keypair, 0 );
   fd_memzero_explicit( keypair_wr, 64UL );
   fd_keyload_mprotect_ro( keypair_wr, 0 );
 
-  fd_cnc_signal( cnc, FD_CNC_SIGNAL_ADD_AUTH_VOTER );
-  ulong signal = fd_cnc_wait( cnc, FD_CNC_SIGNAL_ADD_AUTH_VOTER, LONG_MAX, NULL );
+  ulong seq = fd_adminctl_publish( adminctl, FD_ADMINCTL_CMD_ADD_AUTH_VOTER, req, sizeof(fd_adminctl_app_t) );
 
-  int result = req->add_auth_voter.result;
-  fd_memzero_explicit( req->add_auth_voter.keypair, 64UL );
-  fd_cnc_close( cnc );
+  ulong result = fd_adminctl_wait( adminctl, seq );
+  fd_memzero_explicit( req, sizeof(fd_adminctl_app_t) );
 
-  if( FD_UNLIKELY( signal!=FD_CNC_SIGNAL_RUN ) ) FD_LOG_ERR(( "admin tile failed while adding authorized voter, signal %lu", signal ));
-
-  if( FD_UNLIKELY( result!=FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_SUCCESS ) ) {
+  if( FD_UNLIKELY( result!=FD_ADMINCTL_ADD_AUTH_VOTER_RESULT_SUCCESS ) ) {
     FD_LOG_WARNING(( "Failed to add authorized voter key, check validator logs for more details" ));
   } else {
     FD_LOG_NOTICE(( "Authorized voter key added" ));

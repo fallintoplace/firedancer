@@ -2,11 +2,11 @@
 #include "../../disco/keyguard/fd_keyswitch.h"
 #include "../../ballet/ed25519/fd_ed25519.h"
 
-#include "fd_admin.h"
+#include "fd_adminctl.h"
 #include "generated/fd_admin_tile_seccomp.h"
 
 struct fd_admin_tile_ctx {
-  fd_cnc_t *       cnc;
+  fd_adminctl_t *  adminctl;
   fd_keyswitch_t * tower_av_keyswitch;
   fd_keyswitch_t * sign_av_keyswitch[ FD_TOPO_MAX_TILES ];
   ulong            sign_av_keyswitch_cnt;
@@ -33,13 +33,11 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_admin_tile_ctx_t * ctx     = (fd_admin_tile_ctx_t *)scratch;
   fd_memset( ctx, 0, sizeof(fd_admin_tile_ctx_t) );
 
-  fd_topo_obj_t const * cnc_obj = fd_topo_find_tile_obj( topo, tile, "cnc" );
-  FD_TEST( cnc_obj );
+  fd_topo_obj_t const * adminctl_obj = fd_topo_find_tile_obj( topo, tile, "adminctl" );
+  FD_TEST( adminctl_obj );
 
-  ctx->cnc = fd_cnc_join( fd_topo_obj_laddr( topo, cnc_obj->id ) );
-  FD_TEST( ctx->cnc );
-  FD_TEST( fd_cnc_type( ctx->cnc )==FD_CNC_ADMIN_TYPE );
-  FD_TEST( fd_cnc_app_sz( ctx->cnc )>=sizeof(fd_admin_cnc_t) );
+  ctx->adminctl = fd_adminctl_join( fd_topo_obj_laddr( topo, adminctl_obj->id ) );
+  FD_TEST( ctx->adminctl );
 
   ulong tower_idx = fd_topo_find_tile( topo, "tower", 0UL );
   FD_TEST( tower_idx!=ULONG_MAX );
@@ -58,8 +56,6 @@ unprivileged_init( fd_topo_t const *      topo,
   FD_TEST( ctx->sign_av_keyswitch_cnt );
 
   FD_TEST( fd_sha512_join( fd_sha512_new( ctx->sha512 ) ) );
-
-  fd_cnc_signal( ctx->cnc, FD_CNC_SIGNAL_RUN );
 }
 
 /* The process of adding an authorized voter to the validator must be
@@ -123,8 +119,8 @@ poll_add_authorized_voter( fd_admin_tile_ctx_t * ctx,
         *state = FD_ADD_AUTH_VOTER_STATE_LOCKED;
         FD_LOG_INFO(( "Locking authorized voter set for authorized voter update..." ));
       } else {
-        /* keyswitch changes should be guarded and ordered by CNC.  If
-           the keyswitch is in a locked state means there is unexpected
+        /* keyswitch changes should be guarded and ordered by adminctl.
+           If the keyswitch is in a locked state means there is unexpected
            process state and the validator should crash. */
         FD_LOG_CRIT(( "keyswitch is in a locked state but should be unlocked" ));
       }
@@ -216,9 +212,10 @@ poll_add_authorized_voter( fd_admin_tile_ctx_t * ctx,
 }
 
 static void FD_FN_SENSITIVE
-add_authorized_voter( fd_admin_tile_ctx_t * ctx ) {
+add_authorized_voter( fd_admin_tile_ctx_t *          ctx,
+                      fd_adminctl_add_auth_voter_t * req ) {
 
-  fd_admin_cnc_add_auth_voter_t * req = fd_cnc_app_laddr( ctx->cnc );
+  fd_adminctl_t * adminctl = ctx->adminctl;
 
   uchar public_key[ 32UL ];
   fd_ed25519_public_from_private( public_key, req->keypair, ctx->sha512 );
@@ -234,8 +231,8 @@ add_authorized_voter( fd_admin_tile_ctx_t * ctx ) {
     poll_add_authorized_voter( ctx, &state, req->keypair, &has_error );
     if( FD_UNLIKELY( state==FD_ADD_AUTH_VOTER_STATE_UNLOCKED ) ) break;
   }
-  req->result = FD_UNLIKELY( has_error ) ? FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_FAILED : FD_CNC_ADMIN_ADD_AUTH_VOTER_RESULT_SUCCESS;
-  fd_memzero_explicit( req->keypair, 64UL );
+
+  fd_adminctl_complete( adminctl, FD_UNLIKELY( has_error ) ? FD_ADMINCTL_ADD_AUTH_VOTER_RESULT_FAILED : FD_ADMINCTL_ADD_AUTH_VOTER_RESULT_SUCCESS );
 }
 
 static inline void FD_FN_SENSITIVE
@@ -244,16 +241,21 @@ after_credit( fd_admin_tile_ctx_t * ctx,
               int *                 opt_poll_in FD_PARAM_UNUSED,
               int *                 charge_busy ) {
 
-  ulong signal = fd_cnc_signal_query( ctx->cnc );
-  switch( signal ) {
-    case FD_CNC_SIGNAL_RUN: return;
-    case FD_CNC_SIGNAL_ADD_AUTH_VOTER:
-      add_authorized_voter( ctx );
-      fd_cnc_signal( ctx->cnc, FD_CNC_SIGNAL_RUN );
+  fd_adminctl_t * adminctl = ctx->adminctl;
+  void *         data      = NULL;
+  ulong          data_sz   = 0UL;
+
+  ulong cmd = fd_adminctl_poll( adminctl, &data, &data_sz );
+  switch( cmd ) {
+    case FD_ADMINCTL_CMD_IDLE:
+      return;
+    case FD_ADMINCTL_CMD_ADD_AUTH_VOTER:
+      if( FD_UNLIKELY( data_sz<sizeof(fd_adminctl_add_auth_voter_t) ) ) FD_LOG_ERR(( "unexpected adminctl add-authorized-voter payload_sz %lu", data_sz ));
+      add_authorized_voter( ctx, (fd_adminctl_add_auth_voter_t *)data );
       *charge_busy = 1;
       break;
     default:
-      FD_LOG_ERR(( "unexpected admin cnc signal %lu", signal ));
+      FD_LOG_ERR(( "unexpected adminctl cmd %lu", cmd ));
   }
 }
 
