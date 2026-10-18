@@ -237,6 +237,7 @@ fd_pcapng_iter_next1( fd_pcapng_iter_t * iter ) {
         return NULL;
       }
 
+      if( !iter->iface_cnt ) iter->first_snap_len = idb.snap_len;
       fd_pcapng_idb_desc_t * iface = &iter->iface[ iter->iface_cnt++ ];
       memset( iface, 0, sizeof(fd_pcapng_idb_desc_t) );
       iface->link_type = idb.link_type;
@@ -286,29 +287,32 @@ fd_pcapng_iter_next1( fd_pcapng_iter_t * iter ) {
       break;
     }
     case FD_PCAPNG_BLOCK_TYPE_SPB: {
-      /* Read SPB */
-      if( FD_UNLIKELY( hdr.block_sz<sizeof(fd_pcapng_spb_t) ) ) {
+      /* A Simple Packet Block uses the first interface's SnapLen and
+         has no options.  The last four bytes are the block footer. */
+      if( FD_UNLIKELY( (!iter->iface_cnt) ||
+                       (hdr.block_sz<sizeof(fd_pcapng_spb_t)+sizeof(uint)) ) ) {
         iter->error = EPROTO;
-        FD_LOG_WARNING(( "pcapng: invalid SPB block size (%#x)", hdr.block_sz ));
+        FD_LOG_WARNING(( "pcapng: missing IDB or invalid SPB block size (%#x)", hdr.block_sz ));
         return NULL;
       }
-
-      uint hdr_sz  = sizeof(fd_pcapng_spb_t);
-      uint data_sz = hdr.block_sz - hdr_sz;
 
       fd_pcapng_spb_t spb = FD_LOAD( fd_pcapng_spb_t, iter->block_buf );
-      iter->block_buf_pos = hdr_sz;
+      uint data_sz = spb.orig_len;
+      if( iter->first_snap_len ) data_sz = fd_uint_min( data_sz, iter->first_snap_len );
 
-      if( FD_UNLIKELY( spb.orig_len > (iter->block_buf_sz - iter->block_buf_pos) ) ) {
+      uint padded_sz = hdr.block_sz - sizeof(fd_pcapng_spb_t) - sizeof(uint);
+      if( FD_UNLIKELY( data_sz>padded_sz ||
+                       fd_uint_align_up( data_sz, 4U )!=padded_sz ) ) {
         iter->error = EPROTO;
-        FD_LOG_WARNING(( "pcapng: invalid SPB block size (%#x)", hdr.block_sz ));
+        FD_LOG_WARNING(( "pcapng: invalid SPB packet length (%#x)", hdr.block_sz ));
         return NULL;
       }
-      pkt->data = iter->block_buf + iter->block_buf_pos;
 
+      pkt->data    = iter->block_buf + sizeof(fd_pcapng_spb_t);
       pkt->type    = FD_PCAPNG_FRAME_SIMPLE;
-      pkt->data_sz = (ushort)data_sz;
-      pkt->orig_sz = (ushort)spb.orig_len;
+      pkt->data_sz = data_sz;
+      pkt->orig_sz = spb.orig_len;
+      pkt->idb     = &iter->iface[ 0 ];
       return pkt;
     }
     case FD_PCAPNG_BLOCK_TYPE_EPB: {

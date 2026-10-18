@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <errno.h>
 
 #if FD_USING_GCC && __GNUC__ >= 15
 #pragma GCC diagnostic ignored "-Wunterminated-string-initialization"
@@ -264,6 +265,104 @@ test_pcapng_epb_noopts( void ) {
   FD_TEST( 0==fclose( pcap ) );
 }
 
+/* A Simple Packet Block carries no captured-length field; the reader
+   must use the first interface's SnapLen and exclude padding/footer. */
+
+static void
+write_pcapng_spb( FILE *        pcap,
+                  uchar const * data,
+                  uint          cap_len,
+                  uint          orig_len ) {
+  uint padded_sz = fd_uint_align_up( cap_len, 4U );
+  fd_pcapng_spb_t spb = {
+    .block_type = FD_PCAPNG_BLOCK_TYPE_SPB,
+    .block_sz   = (uint)sizeof(fd_pcapng_spb_t) + padded_sz + (uint)sizeof(uint),
+    .orig_len   = orig_len
+  };
+  uchar pad[3] = {0};
+  FD_TEST( 1UL==fwrite( &spb, sizeof(spb), 1UL, pcap ) );
+  if( cap_len ) FD_TEST( 1UL==fwrite( data, cap_len, 1UL, pcap ) );
+  if( padded_sz>cap_len ) FD_TEST( 1UL==fwrite( pad, padded_sz-cap_len, 1UL, pcap ) );
+  FD_TEST( 1UL==fwrite( &spb.block_sz, sizeof(uint), 1UL, pcap ) );
+}
+
+static void
+test_pcapng_spb( void ) {
+  uchar buf[512UL] = {0};
+  FILE * pcap = fmemopen( buf, sizeof(buf), "wb+" );
+  FD_TEST( pcap );
+  FD_TEST( 1UL==fd_pcapng_fwrite_shb( NULL, pcap ) );
+
+  fd_pcapng_idb_t idb = {
+    .block_type = FD_PCAPNG_BLOCK_TYPE_IDB,
+    .block_sz   = (uint)( sizeof(fd_pcapng_idb_t) + sizeof(uint) ),
+    .link_type  = FD_PCAPNG_LINKTYPE_ETHERNET,
+    .snap_len   = 5U
+  };
+  FD_TEST( 1UL==fwrite( &idb, sizeof(idb), 1UL, pcap ) );
+  FD_TEST( 1UL==fwrite( &idb.block_sz, sizeof(uint), 1UL, pcap ) );
+  /* SPBs always use the first interface, even if another IDB follows. */
+  idb.snap_len = 2U;
+  FD_TEST( 1UL==fwrite( &idb, sizeof(idb), 1UL, pcap ) );
+  FD_TEST( 1UL==fwrite( &idb.block_sz, sizeof(uint), 1UL, pcap ) );
+
+  uchar const data[] = {0x11, 0x22, 0x33, 0x44, 0x55};
+  struct {
+    uint cap_len;
+    uint orig_len;
+  } const cases[] = {
+    {4U,     4U},
+    {3U,     3U},
+    {5U,    10U}, /* truncated to the first IDB's SnapLen */
+    {5U, 70000U}, /* original length must not be narrowed to 16 bits */
+    {0U,     0U}
+  };
+
+  for( ulong i=0UL; i<sizeof(cases)/sizeof(cases[0]); i++ )
+    write_pcapng_spb( pcap, data, cases[i].cap_len, cases[i].orig_len );
+  write_pcapng_spb( pcap, data, 4U, 0U ); /* invalid: extra payload bytes */
+
+  FD_TEST( 0==fflush( pcap ) );
+  rewind( pcap );
+  void * mem = aligned_alloc( fd_pcapng_iter_align(), fd_pcapng_iter_footprint() );
+  FD_TEST( mem );
+  fd_pcapng_iter_t * iter = fd_pcapng_iter_new( mem, pcap );
+  FD_TEST( iter );
+
+  for( ulong i=0UL; i<sizeof(cases)/sizeof(cases[0]); i++ ) {
+    fd_pcapng_frame_t const * frame = fd_pcapng_iter_next( iter );
+    FD_TEST( frame );
+    FD_TEST( frame->type==FD_PCAPNG_FRAME_SIMPLE );
+    FD_TEST( frame->data_sz==cases[i].cap_len );
+    FD_TEST( frame->orig_sz==cases[i].orig_len );
+    FD_TEST( frame->if_idx==0U );
+    FD_TEST( frame->idb==&iter->iface[0] );
+    FD_TEST( fd_memeq( frame->data, data, cases[i].cap_len ) );
+  }
+  FD_TEST( !fd_pcapng_iter_next( iter ) );
+  FD_TEST( EPROTO==fd_pcapng_iter_err( iter ) );
+
+  free( fd_pcapng_iter_delete( iter ) );
+  FD_TEST( 0==fclose( pcap ) );
+
+  /* SPBs are invalid without a preceding Interface Description Block. */
+  memset( buf, 0, sizeof(buf) );
+  pcap = fmemopen( buf, sizeof(buf), "wb+" );
+  FD_TEST( pcap );
+  FD_TEST( 1UL==fd_pcapng_fwrite_shb( NULL, pcap ) );
+  write_pcapng_spb( pcap, data, 4U, 4U );
+  FD_TEST( 0==fflush( pcap ) );
+  rewind( pcap );
+  mem = aligned_alloc( fd_pcapng_iter_align(), fd_pcapng_iter_footprint() );
+  FD_TEST( mem );
+  iter = fd_pcapng_iter_new( mem, pcap );
+  FD_TEST( iter );
+  FD_TEST( !fd_pcapng_iter_next( iter ) );
+  FD_TEST( EPROTO==fd_pcapng_iter_err( iter ) );
+  free( fd_pcapng_iter_delete( iter ) );
+  FD_TEST( 0==fclose( pcap ) );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -275,6 +374,7 @@ main( int     argc,
   test_pcapng_fwrite_tls_key_log();
   test_pcapng_dogfood();
   test_pcapng_epb_noopts();
+  test_pcapng_spb();
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

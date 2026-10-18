@@ -122,6 +122,7 @@ struct __attribute__((aligned(FD_PCAPNG_ITER_ALIGN))) fd_pcapng_iter {
 # define FD_PCAPNG_IFACE_CNT 16
   fd_pcapng_idb_desc_t iface[ FD_PCAPNG_IFACE_CNT ];
   uint                 iface_cnt;
+  uint                 first_snap_len; /* SnapLen of the first IDB, used by SPBs */
 
   uchar  block_buf[ FD_PCAPNG_BLOCK_SZ ];
   ulong  block_buf_sz;
